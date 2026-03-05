@@ -1,0 +1,8 @@
+flask
+ccxt==4.5.40
+requests
+pandas
+pandas_ta
+numpy
+websocket-client
+gunicorn
