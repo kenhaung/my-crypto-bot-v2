@@ -1,0 +1,1159 @@
+import os, time, ccxt, requests, pandas as pd, pandas_ta as ta
+import datetime, logging, numpy as np, json, sqlite3
+from flask import Flask
+from threading import Thread, Lock
+from collections import OrderedDict, defaultdict
+try:
+    import websocket as ws_lib
+    WS_AVAILABLE = True
+except ImportError:
+    WS_AVAILABLE = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+threads_started  = False
+threads_lock     = Lock()
+sent_signals     = OrderedDict()
+signals_lock     = Lock()
+active_positions = {}
+positions_lock   = Lock()
+
+ws_cvd_buffer  = defaultdict(lambda: {'buy': 0.0, 'sell': 0.0, 'ts': 0.0})
+ws_cvd_lock    = Lock()
+ws_connections = {}
+
+DB_PATH = '/app/data/radar_v2.db'
+
+# ════════════════════════════════════════════
+# 可調參數
+# ════════════════════════════════════════════
+
+TOP_SYMBOLS        = 40
+MAX_POSITIONS      = 10
+MAX_LONG           = 6
+MAX_SHORT          = 6
+MAX_SIGNALS_MEMORY = 500
+SIGNAL_EXPIRY_TIME = 86400
+
+# 風控
+ATR_TP1_MULT   = 2.0   # 第一批止盈（50%倉位）
+ATR_TP2_MULT   = 4.0   # 第二批止盈（剩餘50%）
+MAX_HOLD_HOURS = 48    # 4H 週期持倉時間拉長（原 24H）
+
+# 止損：結構低/高點 + buffer，不再用 ATR 倍數
+# 多單止損 = 近 BREAKOUT_LOOKBACK 根最低點 * (1 - SL_STRUCT_BUFFER)
+# 空單止損 = 近 BREAKOUT_LOOKBACK 根最高點 * (1 + SL_STRUCT_BUFFER)
+SL_STRUCT_BUFFER = 0.003   # 結構位下方/上方再加 0.3% buffer
+
+# 最低止損距離（防止結構太近）
+MIN_SL_PCT = 0.03   # 最少 3%
+# 最大止損距離（防止結構太遠，風報比過差）
+MAX_SL_PCT = 0.12   # 最多 12%
+
+# 趨勢 EMA
+EMA_FAST  = 20
+EMA_MID   = 50
+EMA_SLOW  = 200
+
+# 突破條件
+BREAKOUT_LOOKBACK  = 20
+VOLUME_MULTIPLIER  = 2.0   # 提高量能門檻（原 1.5x），過濾低量假突破
+
+# RSI 動量（收緊範圍，過濾弱勢訊號）
+RSI_BULL_MIN = 55   # 原 50，排除剛突破 50 的弱勢多單
+RSI_BULL_MAX = 72   # 原 75
+RSI_BEAR_MIN = 28   # 原 25
+RSI_BEAR_MAX = 45   # 原 50
+
+# 勝率門檻
+WINRATE_THRESHOLD   = 0.40
+WINRATE_REDUCED_MAX = 5
+
+# 時間框架（改為 4H，與 V1 一致，過濾雜訊）
+TIMEFRAME = '4h'
+
+# 非加密貨幣過濾
+_STOCK_SYMBOLS = {
+    'TSLA','AAPL','GOOGL','AMZN','MSFT','NVDA','META','BABA',
+    'NFLX','COIN','MSTR','AMD','INTC','ORCL','PYPL','UBER',
+}
+_METAL_SYMBOLS = {'XAU','XAG','PAXG','XAUT'}
+
+def is_crypto_symbol(symbol: str) -> bool:
+    base = symbol.split('/')[0]
+    if base in _METAL_SYMBOLS: return False
+    if base in _STOCK_SYMBOLS: return False
+    return True
+
+LARGE_CAP = {'BTC/USDT','ETH/USDT','BNB/USDT','SOL/USDT'}
+MID_CAP   = {
+    'XRP/USDT','ADA/USDT','AVAX/USDT','DOT/USDT','MATIC/USDT',
+    'LINK/USDT','UNI/USDT','ATOM/USDT','LTC/USDT','ETC/USDT'
+}
+
+
+# ════════════════════════════════════════════
+# SQLite 持久化
+# 新增欄位：tp2（第二批止盈）、tp1_hit（第一批是否已出場）
+# ════════════════════════════════════════════
+
+def init_db():
+    import os as _os
+    _os.makedirs(_os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS positions (
+        symbol      TEXT PRIMARY KEY,
+        side        TEXT,
+        ep          REAL,
+        sl          REAL,
+        tp1         REAL,
+        tp2         REAL,
+        tp1_hit     INTEGER DEFAULT 0,
+        atr         REAL,
+        entry_time  REAL,
+        category    TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS trades (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol      TEXT,
+        side        TEXT,
+        pnl         REAL,
+        won         INTEGER,
+        trade_time  TEXT,
+        week_id     TEXT,
+        exit_type   TEXT
+    )''')
+    conn.commit()
+    conn.close()
+    log.info("[DB] V2 持久化資料庫已初始化（分批止盈版）")
+
+def get_week_id() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return f"{now.year}-W{now.isocalendar()[1]:02d}"
+
+def db_save_position(symbol: str, data: dict):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('''INSERT OR REPLACE INTO positions
+            (symbol, side, ep, sl, tp1, tp2, tp1_hit, atr, entry_time, category)
+            VALUES (?,?,?,?,?,?,?,?,?,?)''',
+            (symbol, data['side'], data['ep'], data['sl'],
+             data['tp1'], data['tp2'], int(data.get('tp1_hit', False)),
+             data.get('atr', 0), data.get('entry_time', time.time()),
+             data.get('category', '')))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"[DB] 儲存持倉失敗: {e}")
+
+def db_update_position(symbol: str, updates: dict):
+    """通用更新持倉欄位"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        for key, val in updates.items():
+            conn.execute(f'UPDATE positions SET {key}=? WHERE symbol=?',
+                         (val, symbol))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"[DB] 更新持倉失敗: {e}")
+
+def db_remove_position(symbol: str):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('DELETE FROM positions WHERE symbol=?', (symbol,))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"[DB] 刪除持倉失敗: {e}")
+
+def db_load_positions() -> dict:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute('SELECT * FROM positions').fetchall()
+        conn.close()
+        result = {}
+        for r in rows:
+            result[r[0]] = {
+                'side': r[1], 'ep': r[2], 'sl': r[3],
+                'tp1': r[4], 'tp2': r[5], 'tp1_hit': bool(r[6]),
+                'atr': r[7], 'entry_time': r[8], 'category': r[9]
+            }
+        return result
+    except Exception as e:
+        log.warning(f"[DB] 載入持倉失敗: {e}")
+        return {}
+
+def db_save_trade(symbol: str, side: str, pnl: float,
+                  won: bool, exit_type: str = ''):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute('''INSERT INTO trades
+            (symbol, side, pnl, won, trade_time, week_id, exit_type)
+            VALUES (?,?,?,?,?,?,?)''',
+            (symbol, side, pnl, int(won),
+             datetime.datetime.now(datetime.timezone.utc).isoformat(),
+             get_week_id(), exit_type))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"[DB] 儲存交易失敗: {e}")
+
+def _calc_stats(rows: list) -> dict:
+    """共用統計計算"""
+    trades = [{'pnl': r[0], 'won': bool(r[1])} for r in rows]
+    total  = len(trades)
+    wins   = sum(1 for t in trades if t['won'])
+    pnls   = [t['pnl'] for t in trades]
+    wr     = (wins / total * 100) if total > 0 else 0
+    avg    = (sum(pnls) / total)  if total > 0 else 0
+    streak = cur = 0
+    for t in trades:
+        cur    = cur + 1 if not t['won'] else 0
+        streak = max(streak, cur)
+    return {
+        'total': total, 'wins': wins, 'losses': total - wins,
+        'win_rate': wr, 'avg_pnl': avg,
+        'max_loss_streak': streak,
+        'best':  max(pnls) if pnls else 0,
+        'worst': min(pnls) if pnls else 0,
+    }
+
+def _empty_stats() -> dict:
+    return {'total':0,'wins':0,'losses':0,'win_rate':0,
+            'avg_pnl':0,'max_loss_streak':0,'best':0,'worst':0}
+
+def db_load_weekly_stats(week_id: str = None) -> dict:
+    try:
+        wid  = week_id or get_week_id()
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            'SELECT pnl, won FROM trades WHERE week_id=?', (wid,)
+        ).fetchall()
+        conn.close()
+        return _calc_stats(rows)
+    except Exception as e:
+        log.warning(f"[DB] 讀取週報失敗: {e}")
+        return _empty_stats()
+
+def db_load_monthly_stats(year: int, month: int) -> dict:
+    """查詢指定年月的所有交易（依 trade_time 日期範圍）"""
+    try:
+        import calendar
+        last_day = calendar.monthrange(year, month)[1]
+        date_from = f"{year}-{month:02d}-01"
+        date_to   = f"{year}-{month:02d}-{last_day:02d}T23:59:59"
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            'SELECT pnl, won FROM trades WHERE trade_time >= ? AND trade_time <= ?',
+            (date_from, date_to)
+        ).fetchall()
+        conn.close()
+        return _calc_stats(rows)
+    except Exception as e:
+        log.warning(f"[DB] 讀取月報失敗: {e}")
+        return _empty_stats()
+
+def db_load_recent_stats(days: int = 7) -> dict:
+    """查詢最近 N 天的交易，用 trade_time 範圍，不依賴 week_id。
+    每日報告用此函式，避免週次切換造成 0 筆問題。"""
+    try:
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=days)).isoformat()
+        conn  = sqlite3.connect(DB_PATH)
+        rows  = conn.execute(
+            'SELECT pnl, won FROM trades WHERE trade_time >= ?', (since,)
+        ).fetchall()
+        conn.close()
+        return _calc_stats(rows)
+    except Exception as e:
+        log.warning(f"[DB] 讀取近期統計失敗: {e}")
+        return _empty_stats()
+
+def db_load_all_stats() -> dict:
+    """撈取全部歷史交易，供回測和累計統計用。"""
+    try:
+        conn  = sqlite3.connect(DB_PATH)
+        rows  = conn.execute(
+            'SELECT pnl, won FROM trades ORDER BY trade_time'
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return {**_empty_stats(), 'total_pnl': 0}
+        base = _calc_stats(rows)
+        base['total_pnl'] = sum(r[0] for r in rows)
+        return base
+    except Exception as e:
+        log.warning(f"[DB] 讀取全部統計失敗: {e}")
+        return {**_empty_stats(), 'total_pnl': 0}
+
+
+# ════════════════════════════════════════════
+# 工具函式
+# ════════════════════════════════════════════
+
+def send_telegram(message: str) -> bool:
+    token   = os.environ.get('TELEGRAM_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        log.warning("Telegram 環境變數未設定")
+        return False
+    url    = f"https://api.telegram.org/bot{token}/sendMessage"
+    params = {'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        log.error(f"Telegram 發送失敗: {e}")
+        return False
+
+def get_exchange():
+    return ccxt.binance({
+        'urls': {'api': {
+            'public':     'https://api3.binance.com/api/v3',
+            'fapiPublic': 'https://fapi.binance.com/fapi/v1',
+        }},
+        'options':         {'defaultType': 'future'},
+        'enableRateLimit': True,
+    })
+
+_spot_exchange      = None
+_spot_exchange_lock = Lock()
+
+def get_spot_exchange():
+    global _spot_exchange
+    with _spot_exchange_lock:
+        if _spot_exchange is None:
+            _spot_exchange = ccxt.binance({'enableRateLimit': True})
+        return _spot_exchange
+
+def get_top_symbols(exchange, n: int = TOP_SYMBOLS):
+    try:
+        tickers = exchange.fetch_tickers()
+        return [
+            s for s, t in sorted(
+                tickers.items(),
+                key=lambda x: x[1].get('quoteVolume', 0), reverse=True
+            )
+            if '/USDT' in s and is_crypto_symbol(s)
+        ][:n]
+    except Exception as e:
+        log.error(f"取得幣種列表失敗: {e}")
+        return []
+
+def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1)
+    if len(ohlcv) < limit:
+        return None
+    df = pd.DataFrame(ohlcv[:-1], columns=['t','o','h','l','c','v'])
+    df = df.astype({'o':float,'h':float,'l':float,'c':float,'v':float})
+    return df
+
+def get_exit_diagnosis(exchange, symbol: str, pos: dict,
+                       curr_c: float, result: str) -> str:
+    """
+    出場診斷標注，用於止損和超時出場。
+    記錄出場當下的市場狀態，供事後分析用。
+    """
+    try:
+        df = fetch_ohlcv_df(exchange, symbol, TIMEFRAME, 30)
+        if df is None:
+            return '（診斷資料不足）'
+
+        c   = df['c']
+        h   = df['h']
+        v   = df['v']
+
+        # BTC 大盤方向（用 EMA20 vs EMA50 簡單判斷）
+        try:
+            btc_df  = fetch_ohlcv_df(exchange, 'BTC/USDT:USDT', TIMEFRAME, 55)
+            if btc_df is not None:
+                btc_ema20 = ta.ema(btc_df['c'], length=20).iloc[-1]
+                btc_ema50 = ta.ema(btc_df['c'], length=50).iloc[-1]
+                btc_trend = '📈 BTC多' if btc_ema20 > btc_ema50 else '📉 BTC空'
+            else:
+                btc_trend = 'BTC未知'
+        except Exception:
+            btc_trend = 'BTC未知'
+
+        # 出場時 RSI
+        rsi_now = float(ta.rsi(c, length=14).iloc[-1])
+
+        # 持倉經過時間
+        entry_time   = pos.get('entry_time', time.time())
+        held_hours   = (time.time() - entry_time) / 3600
+
+        # 突破後經過幾根 K 線（進場後的K線數）
+        # 用 entry_time 和 df 的時間戳計算
+        entry_ts = entry_time * 1000  # ms
+        bars_since = sum(1 for t in df['t'] if t > entry_ts)
+
+        # 出場時量能 vs 均量
+        avg_vol  = float(v.iloc[-6:-1].mean())
+        curr_vol = float(v.iloc[-1])
+        vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 0
+
+        # 出場原因標注
+        reason_tag = {
+            'sl':      '🔴 止損',
+            'timeout': '⏰ 超時',
+        }.get(result, result)
+
+        return (
+            f"{'─'*20}\n"
+            f"📋 出場診斷\n"
+            f"原因: {reason_tag} | 持倉: {held_hours:.1f}h | "
+            f"突破後: {bars_since}根K線\n"
+            f"RSI出場: `{rsi_now:.1f}` | 量能: `{vol_ratio:.1f}x`\n"
+            f"大盤: {btc_trend}"
+        )
+    except Exception as e:
+        log.debug(f"[Diagnosis] {symbol}: {e}")
+        return '（診斷失敗）'
+
+def get_symbol_category(symbol: str) -> str:
+    base  = symbol.split('/')[0]
+    clean = f"{base}/USDT"
+    if clean in LARGE_CAP: return 'large'
+    if clean in MID_CAP:   return 'mid'
+    return 'small'
+
+def calc_effective_atr(atr: float, curr_c: float) -> float:
+    """
+    FIX：防止極低價幣（1000PEPE等）止損點過近。
+    ATR 絕對值至少要達到當前價格的 MIN_SL_PCT。
+    """
+    min_atr = curr_c * MIN_SL_PCT
+    return max(atr, min_atr)
+
+def is_weekend() -> bool:
+    """週六、週日不執行超時出場，避免低量期錯過行情"""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.weekday() >= 5
+
+
+def wait_until_next_4h_close() -> float:
+    """對齊 4H K線收盤，收盤後 2 分鐘掃描
+    4H 收盤時間 UTC: 00:00 / 04:00 / 08:00 / 12:00 / 16:00 / 20:00"""
+    now   = datetime.datetime.now(datetime.timezone.utc)
+    # 下一個 4H 整點
+    next_4h_hour = ((now.hour // 4) + 1) * 4
+    if next_4h_hour >= 24:
+        next_close = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=2, second=0, microsecond=0)
+    else:
+        next_close = now.replace(
+            hour=next_4h_hour, minute=2, second=0, microsecond=0)
+    wait = (next_close - now).total_seconds()
+    return max(wait, 60)
+
+
+# ════════════════════════════════════════════
+# 持倉管理
+# ════════════════════════════════════════════
+
+def position_count() -> int:
+    with positions_lock: return len(active_positions)
+
+def long_count() -> int:
+    with positions_lock:
+        return sum(1 for p in active_positions.values() if p['side'] == 'long')
+
+def short_count() -> int:
+    with positions_lock:
+        return sum(1 for p in active_positions.values() if p['side'] == 'short')
+
+def get_position(symbol: str):
+    with positions_lock: return active_positions.get(symbol)
+
+def add_position(symbol: str, data: dict):
+    with positions_lock: active_positions[symbol] = data
+    db_save_position(symbol, data)
+
+def update_position(symbol: str, updates: dict):
+    with positions_lock:
+        if symbol in active_positions:
+            active_positions[symbol].update(updates)
+    db_update_position(symbol, updates)
+
+def remove_position(symbol: str):
+    with positions_lock: active_positions.pop(symbol, None)
+    db_remove_position(symbol)
+
+def get_all_positions() -> dict:
+    with positions_lock: return dict(active_positions)
+
+def can_open_position(symbol: str, side: str) -> tuple:
+    s       = db_load_recent_stats(days=30)   # 近30天，不受週次切換影響
+    wr      = s['win_rate'] / 100 if s['total'] >= 10 else 1.0
+    eff_max = WINRATE_REDUCED_MAX \
+              if wr < WINRATE_THRESHOLD and s['total'] >= 10 else MAX_POSITIONS
+    if position_count() >= eff_max:
+        return False, f"總倉位已達上限 {eff_max}"
+    if side == 'long'  and long_count()  >= MAX_LONG:
+        return False, f"多單上限 {MAX_LONG}"
+    if side == 'short' and short_count() >= MAX_SHORT:
+        return False, f"空單上限 {MAX_SHORT}"
+    return True, ''
+
+
+# ════════════════════════════════════════════
+# 訊號管理
+# ════════════════════════════════════════════
+
+def is_signal_sent(key: str) -> bool:
+    with signals_lock: return key in sent_signals
+
+def record_signal(key: str):
+    with signals_lock: sent_signals[key] = time.time()
+
+def clean_signals():
+    now = time.time()
+    with signals_lock:
+        for k in [k for k, v in sent_signals.items()
+                  if now - v > SIGNAL_EXPIRY_TIME]:
+            del sent_signals[k]
+        while len(sent_signals) > MAX_SIGNALS_MEMORY:
+            sent_signals.popitem(last=False)
+
+
+# ════════════════════════════════════════════
+# WebSocket CVD
+# ════════════════════════════════════════════
+
+def _ws_on_message(symbol_key: str, msg: str):
+    try:
+        data = json.loads(msg)
+        qty  = float(data.get('q', 0))
+        is_buyer_maker = data.get('m', False)
+        with ws_cvd_lock:
+            if is_buyer_maker:
+                ws_cvd_buffer[symbol_key]['sell'] += qty
+            else:
+                ws_cvd_buffer[symbol_key]['buy']  += qty
+            ws_cvd_buffer[symbol_key]['ts'] = time.time()
+    except Exception:
+        pass
+
+def start_ws_cvd(symbol: str):
+    if not WS_AVAILABLE: return
+    symbol_key = symbol.split('/')[0].lower() + 'usdt'
+    if symbol_key in ws_connections: return
+
+    def run():
+        url = f"wss://fstream.binance.com/ws/{symbol_key}@aggTrade"
+        def on_msg(ws, msg):   _ws_on_message(symbol_key, msg)
+        def on_err(ws, err):   log.warning(f"[WS] {symbol_key} 錯誤: {err}")
+        def on_close(ws, *a):
+            log.info(f"[WS] {symbol_key} 連線關閉，5s 後重連")
+            ws_connections.pop(symbol_key, None)
+            time.sleep(5); start_ws_cvd(symbol)
+        def on_open(ws):
+            log.info(f"[WS] {symbol_key} 串流已連線")
+            with ws_cvd_lock:
+                ws_cvd_buffer[symbol_key] = {
+                    'buy': 0.0, 'sell': 0.0, 'ts': time.time()
+                }
+        w = ws_lib.WebSocketApp(url, on_message=on_msg, on_error=on_err,
+                                on_close=on_close, on_open=on_open)
+        ws_connections[symbol_key] = True
+        w.run_forever(ping_interval=30, ping_timeout=10)
+
+    Thread(target=run, daemon=True).start()
+
+def get_cvd_bias(symbol: str) -> str:
+    symbol_key = symbol.split('/')[0].lower() + 'usdt'
+    with ws_cvd_lock:
+        buf = ws_cvd_buffer.get(symbol_key)
+        if not buf or (time.time() - buf['ts']) > 300:
+            return 'neutral'
+        total = buf['buy'] + buf['sell']
+        if total == 0: return 'neutral'
+        ratio = buf['buy'] / total
+    if ratio >= 0.55: return 'bull'
+    if ratio <= 0.45: return 'bear'
+    return 'neutral'
+
+
+# ════════════════════════════════════════════
+# 核心分析：動量突破型 V2
+# Layer 1：EMA 趨勢方向（20/50/200）
+# Layer 2：價格突破近20根高低點 + 成交量放大
+# Layer 3：RSI 動量區間過濾
+# 加分項：CVD 方向一致
+# ════════════════════════════════════════════
+
+def analyze_symbol_v2(exchange, symbol: str):
+
+    df = fetch_ohlcv_df(exchange, symbol, TIMEFRAME, 250)
+    if df is None or len(df) < 210: return None
+
+    c   = df['c']
+    h   = df['h']
+    l   = df['l']
+    v   = df['v']
+
+    raw_atr = ta.atr(h, l, c, length=14).iloc[-1]
+    if not raw_atr or raw_atr <= 0: return None
+
+    curr_c = float(c.iloc[-1])
+
+    # FIX：套用最低止損距離保護
+    atr = calc_effective_atr(raw_atr, curr_c)
+
+    # ── Layer 1：EMA 三線排列 ──
+    ema_fast = ta.ema(c, length=EMA_FAST)
+    ema_mid  = ta.ema(c, length=EMA_MID)
+    ema_slow = ta.ema(c, length=EMA_SLOW)
+
+    ef = ema_fast.iloc[-1]
+    em = ema_mid.iloc[-1]
+    es = ema_slow.iloc[-1]
+
+    # EMA 任一為 NaN（歷史數據不足）直接跳過
+    if pd.isna(ef) or pd.isna(em) or pd.isna(es):
+        return None
+
+    bull_trend = ef > em > es and curr_c > ef
+    bear_trend = ef < em < es and curr_c < ef
+
+    if not bull_trend and not bear_trend:
+        return None
+
+    # ── Layer 2：突破 + 成交量確認 ──
+    recent_high = h.iloc[-(BREAKOUT_LOOKBACK+1):-1].max()
+    recent_low  = l.iloc[-(BREAKOUT_LOOKBACK+1):-1].min()
+    avg_vol     = v.iloc[-BREAKOUT_LOOKBACK-1:-1].mean()
+    curr_vol    = float(v.iloc[-1])
+    vol_confirm = curr_vol >= avg_vol * VOLUME_MULTIPLIER
+
+    # 方向一：改用收盤價確認突破（過濾影線假突破）
+    bull_break = float(c.iloc[-1]) > recent_high and vol_confirm
+    bear_break = float(c.iloc[-1]) < recent_low  and vol_confirm
+
+    if bull_trend and not bull_break: return None
+    if bear_trend and not bear_break: return None
+
+    # ── Layer 3：RSI 動量 ──
+    rsi = ta.rsi(c, length=14).iloc[-1]
+    if pd.isna(rsi): return None
+    if bull_trend and not (RSI_BULL_MIN <= rsi <= RSI_BULL_MAX): return None
+    if bear_trend and not (RSI_BEAR_MIN <= rsi <= RSI_BEAR_MAX): return None
+
+    # ── CVD 加分項 ──
+    cvd = get_cvd_bias(symbol)
+    cvd_ok = (bull_trend and cvd in ('bull','neutral')) or \
+             (bear_trend and cvd in ('bear','neutral'))
+    if not cvd_ok: return None
+
+    side = 'long' if bull_trend else 'short'
+
+    # 方向四：止損改為結構位（突破前低/前高 + buffer）
+    # 比 ATR 止損更有結構依據，主力洗盤需真正破壞支撐才觸發
+    if side == 'long':
+        struct_sl = recent_low * (1 - SL_STRUCT_BUFFER)
+        sl = min(struct_sl, curr_c * (1 - MIN_SL_PCT))   # 取較低者
+        sl = max(sl, curr_c * (1 - MAX_SL_PCT))           # 不能太遠
+    else:
+        struct_sl = recent_high * (1 + SL_STRUCT_BUFFER)
+        sl = max(struct_sl, curr_c * (1 + MIN_SL_PCT))
+        sl = min(sl, curr_c * (1 + MAX_SL_PCT))
+
+    # ATR 仍用於計算止盈目標
+    # 同時加最大 ATR 限制，防止極低價幣 ATR 過大導致止盈異常
+    MAX_TP_PCT = 0.50   # 止盈最多 50%，超過代表 ATR 異常
+    atr_capped = min(atr, curr_c * MAX_TP_PCT / ATR_TP2_MULT)
+
+    tp1 = curr_c + ATR_TP1_MULT * atr_capped if side == 'long' \
+          else curr_c - ATR_TP1_MULT * atr_capped
+    tp2 = curr_c + ATR_TP2_MULT * atr_capped if side == 'long' \
+          else curr_c - ATR_TP2_MULT * atr_capped
+
+    # 止盈合理性檢查：tp1 必須是正數且距離合理
+    if tp1 <= 0 or tp2 <= 0:
+        log.debug(f"[V2 Skip] {symbol} 止盈為負數 tp1={tp1:.6f}，跳過")
+        return None
+
+    sl_pct  = abs(curr_c - sl)  / curr_c * 100
+    tp1_pct = abs(curr_c - tp1) / curr_c * 100
+    tp2_pct = abs(curr_c - tp2) / curr_c * 100
+
+    # 風報比過差也跳過（止損 > 止盈1）
+    if sl_pct >= tp1_pct:
+        log.debug(f"[V2 Skip] {symbol} 風報比過差 sl={sl_pct:.1f}% >= tp1={tp1_pct:.1f}%")
+        return None
+
+    labels = (
+        f"{'📈 多頭排列' if bull_trend else '📉 空頭排列'} "
+        f"EMA {EMA_FAST}/{EMA_MID}/{EMA_SLOW}\n"
+        f"🚀 {'向上突破' if bull_break else '向下跌破'} "
+        f"近{BREAKOUT_LOOKBACK}根高低點\n"
+        f"📊 成交量 {curr_vol/avg_vol:.1f}x 均量\n"
+        f"💹 RSI {rsi:.1f} | CVD {cvd}\n"
+        f"🛡 止損距離 {sl_pct:.1f}% | "
+        f"🎯1 {tp1_pct:.1f}% | 🎯2 {tp2_pct:.1f}%"
+    )
+
+    return {
+        'side': side, 'ep': curr_c, 'sl': sl,
+        'tp1': tp1, 'tp2': tp2, 'tp1_hit': False,
+        'atr': atr, 'labels': labels, 'rsi': rsi,
+    }
+
+
+# ════════════════════════════════════════════
+# 分批止盈 + 移動止損 + 超時出場
+#
+# 回傳值：
+#   'hold'      → 繼續持有
+#   'tp1'       → 第一批止盈（50%出場，剩餘繼續）
+#   'tp2'       → 第二批止盈（全部出場）
+#   'sl'        → 止損出場
+#   'timeout'   → 超時出場
+# ════════════════════════════════════════════
+
+def handle_position_update(symbol: str, curr_c: float,
+                           curr_h: float = None, curr_l: float = None) -> str:
+    """
+    止損判斷：
+      多單用 curr_l（當根最低價）觸及即出
+      空單用 curr_h（當根最高價）觸及即出
+      止盈仍用收盤價（避免影線假觸發止盈）
+    """
+    pos = get_position(symbol)
+    if not pos: return 'hold'
+
+    side       = pos['side']
+    ep         = pos['ep']
+    sl         = pos['sl']
+    tp1        = pos['tp1']
+    tp2        = pos['tp2']
+    tp1_hit    = pos.get('tp1_hit', False)
+    atr        = pos.get('atr', abs(tp1 - ep) / ATR_TP1_MULT)
+    entry_time = pos.get('entry_time', time.time())
+
+    sl_price_long  = curr_l if curr_l is not None else curr_c
+    sl_price_short = curr_h if curr_h is not None else curr_c
+
+    if (time.time() - entry_time) / 3600 >= MAX_HOLD_HOURS:
+        if is_weekend():
+            log.debug(f"[Weekend] {symbol} 超時但週末，暫不出場")
+            return 'hold'
+        return 'timeout'
+
+    if side == 'long':
+        if not tp1_hit:
+            if curr_c >= tp1:
+                update_position(symbol, {'tp1_hit': True, 'sl': ep})
+                log.info(f"[TP1] {symbol} 多單第一批止盈，止損移至進場價 {ep:.4f}")
+                return 'tp1'
+            if sl_price_long <= sl:
+                return 'sl'
+        else:
+            if curr_c >= tp2:
+                return 'tp2'
+            if sl_price_long <= get_position(symbol)['sl']:
+                return 'sl'
+            new_sl = curr_c - atr
+            if new_sl > get_position(symbol)['sl']:
+                update_position(symbol, {'sl': new_sl})
+                log.info(f"[Trail] {symbol} 多單止損上移 → {new_sl:.4f}")
+    else:
+        if not tp1_hit:
+            if curr_c <= tp1:
+                update_position(symbol, {'tp1_hit': True, 'sl': ep})
+                log.info(f"[TP1] {symbol} 空單第一批止盈，止損移至進場價 {ep:.4f}")
+                return 'tp1'
+            if sl_price_short >= sl:
+                return 'sl'
+        else:
+            if curr_c <= tp2:
+                return 'tp2'
+            if sl_price_short >= get_position(symbol)['sl']:
+                return 'sl'
+            new_sl = curr_c + atr
+            if new_sl < get_position(symbol)['sl']:
+                update_position(symbol, {'sl': new_sl})
+                log.info(f"[Trail] {symbol} 空單止損下移 → {new_sl:.4f}")
+
+    return 'hold'
+
+
+# ════════════════════════════════════════════
+# 主監控迴圈（對齊 4H K線收盤）
+# ════════════════════════════════════════════
+
+def monitor():
+    log.info("=== 動量突破 V2 監控啟動 ===")
+    exchange = None
+
+    while True:
+        try:
+            if exchange is None:
+                exchange = get_exchange()
+
+            symbols = get_top_symbols(exchange)
+            if not symbols:
+                time.sleep(60); continue
+
+            log.info(f"[V2] 掃描 {len(symbols)} 幣種...")
+
+            for symbol in symbols:
+                try:
+                    df_fast = fetch_ohlcv_df(exchange, symbol, TIMEFRAME, 5)
+                    if df_fast is None: continue
+                    curr_c   = float(df_fast['c'].iloc[-1])
+                    curr_h   = float(df_fast['h'].iloc[-1])
+                    curr_l   = float(df_fast['l'].iloc[-1])
+                    last_k_t = df_fast['t'].iloc[-1]
+
+                    pos = get_position(symbol)
+                    if pos:
+                        result  = handle_position_update(symbol, curr_c, curr_h, curr_l)
+                        side    = pos['side']
+                        side_t  = '多' if side == 'long' else '空'
+                        tp1_hit = pos.get('tp1_hit', False)
+                        exit_c  = pos['sl'] if result == 'sl' else curr_c
+
+                        if result == 'tp1':
+                            pnl = abs(curr_c - pos['ep']) / pos['ep'] * 100
+                            send_telegram(
+                                f"✅ *[V2] {side_t}單第一批止盈*: `{symbol}`\n"
+                                f"損益: `+{pnl:.2f}%`（50% 倉位）\n"
+                                f"進場: `{pos['ep']:.4f}` → 止盈1: `{curr_c:.4f}`\n"
+                                f"⚡ 止損已移至進場價，剩餘 50% 追第二批"
+                            )
+                            db_save_trade(symbol, side, pnl, True, 'tp1')
+                            continue
+
+                        elif result in ('tp2', 'sl', 'timeout'):
+                            if result == 'tp2':
+                                pnl  = abs(curr_c - pos['ep']) / pos['ep'] * 100
+                                won  = True
+                                icon = '🏆'
+                                desc = f"{side_t}單第二批止盈"
+                                note = f"（全部出場，共兩批獲利）"
+                                diag = ''
+                            elif result == 'sl':
+                                pnl = (exit_c/pos['ep']-1)*100 if side=='long' \
+                                      else (pos['ep']/exit_c-1)*100
+                                won  = pnl > 0
+                                icon = '❌' if not won else '✅'
+                                desc = f"{side_t}單止損"
+                                note = "（第一批已保本）" if tp1_hit else ""
+                                diag = get_exit_diagnosis(exchange, symbol, pos, curr_c, 'sl')
+                            else:
+                                pnl = (curr_c/pos['ep']-1)*100 if side=='long' \
+                                      else (pos['ep']/curr_c-1)*100
+                                won  = pnl > 0
+                                icon = '⏰'
+                                desc = f"持倉 {MAX_HOLD_HOURS}h 超時出場"
+                                note = ""
+                                diag = get_exit_diagnosis(exchange, symbol, pos, curr_c, 'timeout')
+
+                            send_telegram(
+                                f"{icon} *[V2] {desc}*: `{symbol}`\n"
+                                f"損益: `{pnl:+.2f}%` {note}\n"
+                                f"進場: `{pos['ep']:.4f}` → 出場: `{exit_c:.4f}`"
+                                + (f"\n{diag}" if diag else "")
+                            )
+                            db_save_trade(symbol, side, pnl, won, result)
+                            remove_position(symbol)
+                        continue
+
+                    # 訊號去重
+                    base_key = f"{symbol}_{last_k_t}"
+                    if is_signal_sent(f"long_{base_key}") or \
+                       is_signal_sent(f"short_{base_key}"):
+                        continue
+
+                    result = analyze_symbol_v2(exchange, symbol)
+                    if result is None: continue
+
+                    side = result['side']
+                    ok, reason = can_open_position(symbol, side)
+                    if not ok:
+                        log.info(f"[V2 Skip] {symbol} {side}: {reason}")
+                        continue
+
+                    sig_key = f"{side}_{base_key}"
+                    if is_signal_sent(sig_key): continue
+
+                    cat    = get_symbol_category(symbol)
+                    emoji  = '🟢' if side == 'long' else '🔴'
+                    side_t = '多單' if side == 'long' else '空單'
+
+                    send_telegram(
+                        f"{emoji} *[V2] {side_t} 發動*\n"
+                        f"幣種: `{symbol}` [{cat}]\n"
+                        f"價位: `{result['ep']:.4f}`\n"
+                        f"🛡 止損: `{result['sl']:.4f}`\n"
+                        f"🎯 止盈1（50%）: `{result['tp1']:.4f}`\n"
+                        f"🏆 止盈2（50%）: `{result['tp2']:.4f}`\n"
+                        f"{'─'*20}\n"
+                        f"{result['labels']}"
+                    )
+                    record_signal(sig_key)
+                    add_position(symbol, {
+                        'side': side, 'ep': result['ep'],
+                        'sl': result['sl'],
+                        'tp1': result['tp1'], 'tp2': result['tp2'],
+                        'tp1_hit': False,
+                        'atr': result['atr'], 'entry_time': time.time(),
+                        'category': cat,
+                    })
+                    log.info(
+                        f"[V2] {side_t}開倉: {symbol} [{cat}] "
+                        f"@ {result['ep']:.4f} "
+                        f"SL={result['sl']:.4f} "
+                        f"TP1={result['tp1']:.4f} "
+                        f"TP2={result['tp2']:.4f}"
+                    )
+
+                except Exception as e:
+                    log.warning(f"[V2 Monitor] {symbol}: {e}")
+                    continue
+
+            clean_signals()
+            s       = db_load_recent_stats(days=30)
+            eff_max = WINRATE_REDUCED_MAX \
+                      if s['total'] >= 10 and s['win_rate']/100 < WINRATE_THRESHOLD \
+                      else MAX_POSITIONS
+            wait    = wait_until_next_4h_close()
+            next_dt = datetime.datetime.now(datetime.timezone.utc) + \
+                      datetime.timedelta(seconds=wait)
+            log.info(
+                f"[V2] 掃描完成 持倉:{position_count()}/{eff_max} "
+                f"近30天勝率:{s['win_rate']:.1f}% "
+                f"下次掃描 UTC {next_dt.strftime('%H:%M')}（{wait/60:.0f}分後）"
+            )
+            time.sleep(wait)
+
+        except Exception as e:
+            log.error(f"[V2 Monitor] 嚴重錯誤: {e}")
+            exchange = None
+            time.sleep(60)
+
+
+# ════════════════════════════════════════════
+# 每日報告
+# ════════════════════════════════════════════
+
+def daily_report_task():
+    last_sent_date = datetime.date.today() - datetime.timedelta(days=1)
+    log.info("[V2 DailyReport] 線程已啟動")
+    while True:
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if now.date() > last_sent_date:
+                log.info(f"[V2 DailyReport] 開始發送 {now.date()}")
+                pos_all = get_all_positions()
+                s       = db_load_recent_stats(days=7)
+                all_s   = db_load_all_stats()
+                if 'total_pnl' not in all_s:
+                    all_s['total_pnl'] = 0
+                eff_max = WINRATE_REDUCED_MAX \
+                          if s['total']>=10 and s['win_rate']/100<WINRATE_THRESHOLD \
+                          else MAX_POSITIONS
+                pos_detail = '\n'.join([
+                    f"  • `{sym}` {p['side']} @ {p['ep']:.4f} "
+                    f"[{p.get('category','?')}] "
+                    f"({'已第一批止盈' if p.get('tp1_hit') else '持倉中'}) "
+                    f"({(time.time()-p.get('entry_time',time.time()))/3600:.1f}h)"
+                    for sym, p in pos_all.items()
+                ]) if pos_all else '  無'
+                send_telegram(
+                    f"📅 *[V2] 動量突破每日報告*\n"
+                    f"⏰ UTC 00:00（台灣 08:00）\n{'─'*24}\n"
+                    f"💼 持倉 ({len(pos_all)}/{eff_max}):\n{pos_detail}\n{'─'*24}\n"
+                    f"近7天: {s['total']} 筆 | 勝率 {s['win_rate']:.1f}% | "
+                    f"平均 {s['avg_pnl']:+.2f}%\n"
+                    f"📊 累計: {all_s['total']} 筆 | 勝率 {all_s['win_rate']:.1f}% | "
+                    f"總損益 {all_s['total_pnl']:+.2f}% | 最大連敗 {all_s['max_loss_streak']}"
+                )
+                last_sent_date = now.date()
+        except Exception as e:
+            log.error(f"[V2 DailyReport]: {e}")
+            send_telegram(f"⚠️ *V2 每日報告發送失敗*\n錯誤: {e}")
+        time.sleep(60)
+
+
+# ════════════════════════════════════════════
+# 每週報告
+# ════════════════════════════════════════════
+
+def weekly_report_task():
+    last_sent_week = -1
+    while True:
+        try:
+            now  = datetime.datetime.now(datetime.timezone.utc)
+            week = now.isocalendar()[1]
+            # 本週還沒發過就補發上週報告，不限定必須在週一
+            if week != last_sent_week:
+                last_week    = now - datetime.timedelta(days=7)
+                last_week_id = f"{last_week.year}-W{last_week.isocalendar()[1]:02d}"
+                s   = db_load_weekly_stats(week_id=last_week_id)
+                eff = WINRATE_REDUCED_MAX \
+                      if s['total']>=10 and s['win_rate']/100<WINRATE_THRESHOLD \
+                      else MAX_POSITIONS
+                status = '⚠️ 勝率未達標，已縮減倉位' if eff==WINRATE_REDUCED_MAX \
+                         else '✅ 勝率正常，維持標準倉位'
+                send_telegram(
+                    f"📊 *[V2] 動量突破每週報告*\n"
+                    f"📅 {last_week_id}\n{chr(9472)*24}\n"
+                    f"📈 總交易: {s['total']} 筆\n"
+                    f"✅ 勝: {s['wins']} | ❌ 敗: {s['losses']}\n"
+                    f"🎯 勝率: `{s['win_rate']:.1f}%`\n"
+                    f"💰 平均損益: `{s['avg_pnl']:+.2f}%`\n"
+                    f"🏆 最佳: `+{s['best']:.2f}%`\n"
+                    f"💀 最差: `{s['worst']:.2f}%`\n"
+                    f"🔴 最大連敗: {s['max_loss_streak']} 筆\n"
+                    f"⚖️ 止盈目標: TP1={ATR_TP1_MULT}ATR / TP2={ATR_TP2_MULT}ATR（結構止損）\n{chr(9472)*24}\n"
+                    f"{status}"
+                )
+                last_sent_week = week
+        except Exception as e:
+            log.error(f"[V2 WeeklyReport]: {e}")
+            send_telegram(f"⚠️ *V2 週報發送失敗*\n錯誤: {e}")
+        time.sleep(3600)
+
+
+def monthly_report_task():
+    last_sent_month = -1
+    while True:
+        try:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            # 新的一個月就補發上月報告，不限定必須在1號 00:00
+            if now.month != last_sent_month:
+                last_month      = now.month - 1 if now.month > 1 else 12
+                last_month_year = now.year if now.month > 1 else now.year - 1
+                s   = db_load_monthly_stats(last_month_year, last_month)
+                eff = WINRATE_REDUCED_MAX \
+                      if s['total']>=10 and s['win_rate']/100<WINRATE_THRESHOLD \
+                      else MAX_POSITIONS
+                status = '⚠️ 勝率未達標' if eff==WINRATE_REDUCED_MAX \
+                         else '✅ 勝率正常'
+                send_telegram(
+                    f"🗓 *[V2] 動量突破月報*\n"
+                    f"📅 {last_month_year}-{last_month:02d}\n{chr(9472)*24}\n"
+                    f"📈 總交易: {s['total']} 筆\n"
+                    f"✅ 勝: {s['wins']} | ❌ 敗: {s['losses']}\n"
+                    f"🎯 勝率: `{s['win_rate']:.1f}%`\n"
+                    f"💰 平均損益: `{s['avg_pnl']:+.2f}%`\n"
+                    f"🏆 最佳: `+{s['best']:.2f}%`\n"
+                    f"💀 最差: `{s['worst']:.2f}%`\n"
+                    f"🔴 最大連敗: {s['max_loss_streak']} 筆\n"
+                    f"{chr(9472)*24}\n{status}"
+                )
+                last_sent_month = now.month
+        except Exception as e:
+            log.error(f"[V2 MonthlyReport]: {e}")
+            send_telegram(f"⚠️ *V2 月報發送失敗*\n錯誤: {e}")
+        time.sleep(1800)
+
+
+# ════════════════════════════════════════════
+# Flask
+# ════════════════════════════════════════════
+
+@app.route('/')
+def home():
+    pos_all = get_all_positions()
+    s       = db_load_recent_stats(days=30)
+    eff_max = WINRATE_REDUCED_MAX \
+              if s['total']>=10 and s['win_rate']/100<WINRATE_THRESHOLD \
+              else MAX_POSITIONS
+    lines = [
+        f"{sym}: {p['side']} @ {p['ep']:.4f} "
+        f"[{p.get('category','?')}] "
+        f"{'(已TP1)' if p.get('tp1_hit') else ''}"
+        for sym, p in pos_all.items()
+    ]
+    return (
+        f"動量突破 V2（4H版）\n"
+        f"持倉 {len(pos_all)}/{eff_max}\n"
+        f"多:{long_count()} 空:{short_count()}\n\n"
+        + ('\n'.join(lines) if lines else '無持倉')
+        + f"\n\n近30天: {s['total']}筆 | 勝率 {s['win_rate']:.1f}%"
+        + f"\n\n清除舊數據: GET /reset_trades"
+    )
+
+@app.route('/reset_trades')
+def reset_trades():
+    """清除所有歷史交易記錄（用於版本升級後清除舊數據）"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        count = conn.execute('SELECT COUNT(*) FROM trades').fetchone()[0]
+        conn.execute('DELETE FROM trades')
+        conn.commit()
+        conn.close()
+        send_telegram(f"🗑 *[V2] 交易記錄已清除*\n共刪除 {count} 筆舊數據\n新版 4H 數據從現在開始累積")
+        log.info(f"[V2] 交易記錄已清除，共 {count} 筆")
+        return f"已清除 {count} 筆交易記錄，新數據從現在開始累積"
+    except Exception as e:
+        return f"清除失敗: {e}"
+
+
+# ════════════════════════════════════════════
+# 啟動
+# ════════════════════════════════════════════
+
+def start_radar():
+    global threads_started
+    with threads_lock:
+        if not threads_started:
+            init_db()
+
+            recovered = db_load_positions()
+            if recovered:
+                with positions_lock:
+                    active_positions.update(recovered)
+                log.info(f"[DB] 恢復 {len(recovered)} 筆持倉")
+
+            if WS_AVAILABLE:
+                try:
+                    ex   = get_exchange()
+                    syms = get_top_symbols(ex)
+                    for s in syms:
+                        start_ws_cvd(s)
+                        time.sleep(0.2)
+                    log.info(f"[V2] 已啟動 {len(syms)} 幣種 WebSocket CVD")
+                except Exception as e:
+                    log.warning(f"WebSocket 預啟動失敗: {e}")
+
+            week_s = db_load_recent_stats(days=30)
+            send_telegram(
+                f"🚀 *動量突破 V2 上線（4H版）*\n"
+                f"策略: EMA趨勢 + 4H收盤突破 + RSI動量\n{'─'*24}\n"
+                f"✅ 時間框架: 4H K線（原1H，提升訊號品質）\n"
+                f"✅ 掃描節奏: 對齊 4H K線收盤\n"
+                f"✅ CVD: {'WebSocket即時' if WS_AVAILABLE else 'REST模式'}\n"
+                f"✅ 分批止盈: TP1={ATR_TP1_MULT}ATR(50%) / TP2={ATR_TP2_MULT}ATR(50%)\n"
+                f"✅ 結構止損: 近{BREAKOUT_LOOKBACK}根低/高點+{SL_STRUCT_BUFFER*100:.1f}%buffer\n"
+                f"✅ 持倉持久化: SQLite\n{'─'*24}\n"
+                f"EMA: {EMA_FAST}/{EMA_MID}/{EMA_SLOW}\n"
+                f"突破: 近{BREAKOUT_LOOKBACK}根 | 量能: {VOLUME_MULTIPLIER}x\n"
+                f"RSI 多頭: {RSI_BULL_MIN}-{RSI_BULL_MAX} | "
+                f"空頭: {RSI_BEAR_MIN}-{RSI_BEAR_MAX}\n"
+                f"止損範圍: {MIN_SL_PCT*100:.0f}%-{MAX_SL_PCT*100:.0f}% | 最長持倉: {MAX_HOLD_HOURS}h\n{'─'*24}\n"
+                f"恢復持倉: {len(active_positions)} 筆 | "
+                f"近30天已交易: {week_s['total']} 筆 勝率 {week_s['win_rate']:.1f}%"
+            )
+            Thread(target=monitor,             daemon=True).start()
+            Thread(target=daily_report_task,   daemon=True).start()
+            Thread(target=weekly_report_task,  daemon=True).start()
+            Thread(target=monthly_report_task, daemon=True).start()
+            threads_started = True
+            log.info("[V2] 所有線程已啟動（含月報）")
+
+
+start_radar()
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
